@@ -4,10 +4,10 @@ from torch.distributions import Normal
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from gym.envs.classic_control import PendulumEnv
-from gym.wrappers.monitoring.video_recorder import VideoRecorder
-from gym.wrappers.rescale_action import RescaleAction
-from gym.wrappers.time_limit import TimeLimit
+from gymnasium.envs.classic_control import PendulumEnv
+from gymnasium.wrappers.monitoring.video_recorder import VideoRecorder
+from gymnasium.wrappers.rescale_action import RescaleAction
+from gymnasium.wrappers.time_limit import TimeLimit
 
 
 def reparametrize(mean_logstd, deterministic=True, LOG_STD_MIN=-20, LOG_STD_MAX=2):
@@ -167,14 +167,46 @@ class Agent(nn.Module):
         for param_target, param_input in zip(target_net.parameters(), input_net.parameters()):
             param_target.data.copy_(param_target.data * (1.0 - ewma_forget) + param_input.data * ewma_forget)
 
-
 class NoisyPendulum(PendulumEnv):
-    def __init__(self, g: float = 10.0, eps: float = 0.0, *args, **kwargs):
+    def __init__(self, target_angle: float = 0, g: float = 10.0, eps: float = 0.0, *args, **kwargs):
         super().__init__(g=g, *args, **kwargs)
         self.eps = eps
+        self.target_angle = self.angle_normalize(target_angle)
+        self.max_speed = 8
+        self.max_torque = 2.0 # you want more torque for weird angles
 
-    def reset(self, *, seed=0):
-        super().reset(seed=seed)
+    def _get_obs(self):
+        theta, thetadot = self.state
+        return np.array([np.cos(theta), np.sin(theta), thetadot], dtype=np.float32)
+
+    def angle_normalize(self, x):
+        return ((x + np.pi) % (2 * np.pi)) - np.pi
+
+    def reward(self, th, thdot, u):
+        cost = np.abs(self.target_angle - self.angle_normalize(th))**2 + 0.1 * thdot ** 2 + 0.001 * (u ** 2)
+        return -cost
+
+    def step(self, u):
+        u = u * self.max_torque # rescale the action from -1..1 to -max_torque..max_torque
+        th, thdot = self.state  # th := theta
+
+        g = self.g
+        m = self.m
+        l = self.l
+        dt = self.dt
+
+        u = np.clip(u, -self.max_torque, self.max_torque)[0]
+        self.last_u = u  # for rendering
+
+        newthdot = thdot + (3 * g / (2 * l) * np.sin(th) + 3.0 / (m * l ** 2) * u) * dt
+        newthdot = np.clip(newthdot, -self.max_speed, self.max_speed)
+        newth = th + newthdot * dt
+
+        self.state = np.array([newth, newthdot])
+        return self._get_obs(), self.reward(th, thdot, u), False, False, {}
+
+    def reset(self, *, seed=0, **kwargs):
+        super().reset(seed=seed, **kwargs)
         eps = self.eps
         high = np.asarray([np.pi + eps, eps])
         low = np.asarray([np.pi - eps, -eps])
@@ -186,16 +218,17 @@ class NoisyPendulum(PendulumEnv):
         return self._get_obs(), {}
 
 
-def make_env(g=10.0, train=True):
+def make_env(target_angle: float = 0, g=10.0, train=True):
     eps = 0.1 if train else 0.0
-    env = TimeLimit(RescaleAction(NoisyPendulum(render_mode='rgb_array', g=g, eps=eps),
+    env = TimeLimit(RescaleAction(NoisyPendulum(target_angle=target_angle, render_mode='rgb_array', g=g, eps=eps),
                                   min_action=-1, max_action=1), max_episode_steps=200)
     return env
 
 
 def run_episode(env, agent, record=False):
+    device = next(agent.parameters()).device
     state, _ = env.reset()
-    state = torch.from_numpy(state).float()
+    state = torch.from_numpy(state).float().to(device)
     episode_return, truncated = 0.0, False
 
     if record:
@@ -205,8 +238,8 @@ def run_episode(env, agent, record=False):
         with torch.inference_mode():
             action = agent(state)
         next_state, reward, _, truncated, _ = env.step(action.item())
-        next_state = torch.from_numpy(next_state).float()
-        reward = torch.tensor([reward], dtype=torch.float)
+        next_state = torch.from_numpy(next_state).float().to(device)
+        reward = torch.tensor([reward], dtype=torch.float).to(device)
 
         if record:
             rec.capture_frame()
@@ -223,19 +256,20 @@ def run_episode(env, agent, record=False):
 
 
 if __name__ == '__main__':
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = 'cpu'
 
+    target_angle = 0 # np.pi/4 -- increase torque for this angle
     agent = Agent().to(device)
-    env = make_env(train=True)
+    env = make_env(target_angle=target_angle, train=True)
 
     for episode in range(50):
         agent.train()
         episode_return = run_episode(env, agent)
-        print(f"train episode={episode}, return={episode_return:.1f}")
-
+        print(f"train episode={episode:02}, return={episode_return:.1f} angle={env.get_wrapper_attr('state')[0]:.2f}")
+ 
     print('Memory buffer has retained', min(agent.memory.entries, agent.memory.max_size), 'out of', agent.memory.entries, 'experiences')
 
-    env = make_env(train=False)
+    env = make_env(target_angle=target_angle, train=False)
 
     for episode in range(50):
         with torch.inference_mode():
@@ -255,7 +289,7 @@ if __name__ == '__main__':
     axes[2].legend()
     plt.savefig("progress.pdf", bbox_inches="tight")
 
-    plt.matshow(agent.memory.sars.detach().numpy().T, cmap="viridis", aspect="auto")
+    plt.matshow(agent.memory.sars.detach().cpu().numpy().T, cmap="viridis", aspect="auto")
     plt.yticks(range(8), ["cos(theta)", "sin(theta)", "theta_dot", "torque action", "reward", "cos(theta')", "sin(theta')", "theta_dot'"])
     for spine in plt.gca().spines.values():
         spine.set_visible(False)
