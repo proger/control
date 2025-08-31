@@ -1,11 +1,15 @@
+import time
+import os
+
+import numpy as np
+import matplotlib.pyplot as plt
 import torch
 import torch.optim as optim
-from torch.distributions import Normal
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from gymnasium.envs.classic_control import PendulumEnv
 from gymnasium.wrappers import RecordVideo, RescaleAction, TimeLimit
+from torch.distributions import Normal
 
 
 def reparametrize(mean_logstd, deterministic=True, LOG_STD_MIN=-20, LOG_STD_MAX=2):
@@ -85,6 +89,7 @@ class Agent(nn.Module):
         self.alpha_losses = []
         self.actor_losses = []
         self.critic_losses = []
+        self.q_gaps = []
 
         self.learning_steps = 0
         self.optimizer = optim.Adam(self.parameter_groups())
@@ -132,11 +137,16 @@ class Agent(nn.Module):
             target_q_value = r_batch + self.td_discount * td_target
 
         sa = torch.cat([s_batch, a_batch], dim=-1)
-        q_loss = F.mse_loss(self.q1(sa), target_q_value) + F.mse_loss(self.q2(sa), target_q_value)
+        q1_pred = self.q1(sa)
+        q2_pred = self.q2(sa)
+        q_loss = F.mse_loss(q1_pred, target_q_value) + F.mse_loss(q2_pred, target_q_value)
         self.optimizer.zero_grad()
         q_loss.backward()
         self.optimizer.step()
         self.critic_losses.append(q_loss.item())
+        # Track Q1-Q2 gap as a diagnostic signal
+        with torch.no_grad():
+            self.q_gaps.append(torch.abs(q1_pred - q2_pred).mean().item())
 
     def update_actor(self, s_batch):
         action, log_prob = reparametrize(self.actor(s_batch), deterministic=False)
@@ -159,6 +169,8 @@ class Agent(nn.Module):
 
         with torch.no_grad():
             self.alpha_log.clamp_(min=np.log(0.01), max=np.log(1))
+            # Track temperature alpha
+            self.alphas.append(self.alpha_log.exp().item())
         self.alpha_losses.append(alpha_loss.item())
 
     def ema_update(self, input_net: nn.Module, target_net: nn.Module, ewma_forget: float):
@@ -223,16 +235,19 @@ def make_env(target_angle: float = 0, g=10.0, train=True):
     return env
 
 
-def run_episode(env, agent, record=False):
+def run_episode(env, agent, record=False) -> tuple[float, int, float, float]:
     device = next(agent.parameters()).device
     state, _ = env.reset()
     state = torch.from_numpy(state).float().to(device)
     episode_return, truncated = 0.0, False
+    steps = 0
+    actions = []
 
     while not truncated:
         with torch.inference_mode():
             action = agent(state)
-        next_state, reward, _, truncated, _ = env.step(action.item())
+        a = action.item()
+        next_state, reward, _, truncated, _ = env.step(a)
         next_state = torch.from_numpy(next_state).float().to(device)
         reward = torch.tensor([reward], dtype=torch.float).to(device)
 
@@ -240,8 +255,12 @@ def run_episode(env, agent, record=False):
 
         episode_return += reward
         state = next_state
+        steps += 1
+        actions.append(a)
 
-    return episode_return.item()
+    action_mean = float(np.mean(actions)) if actions else 0.0
+    action_std = float(np.std(actions)) if actions else 0.0
+    return episode_return.item(), steps, action_mean, action_std
 
 
 if __name__ == '__main__':
@@ -251,10 +270,27 @@ if __name__ == '__main__':
     agent = Agent().to(device)
     env = make_env(target_angle=target_angle, train=True)
 
+    # Tracking for primary metrics
+    train_returns = []
+    train_lengths = []
+    action_means = []
+    action_stds = []
+    cumulative_steps = [0]
+    per_episode_throughput = []
+    train_start_time = time.time()
+
     for episode in range(50):
         agent.train()
-        episode_return = run_episode(env, agent)
-        print(f"train episode={episode:02} return={episode_return:.1f} angle={env.get_wrapper_attr('state')[0]:.2f}")
+        t0 = time.time()
+        episode_return, ep_steps, a_mean, a_std = run_episode(env, agent)
+        dt = max(time.time() - t0, 1e-9)
+        train_returns.append(episode_return)
+        train_lengths.append(ep_steps)
+        action_means.append(a_mean)
+        action_stds.append(a_std)
+        cumulative_steps.append(cumulative_steps[-1] + ep_steps)
+        per_episode_throughput.append(ep_steps / dt)
+        print(f"train episode={episode:02} return={episode_return:.1f} length={ep_steps} angle={env.get_wrapper_attr('state')[0]:.2f}")
  
     print('Memory buffer has retained', min(agent.memory.entries, agent.memory.max_size), 'out of', agent.memory.entries, 'experiences')
 
@@ -266,24 +302,123 @@ if __name__ == '__main__':
     for episode in range(50):
         with torch.inference_mode():
             agent.eval()
-            episode_return = run_episode(env, agent, record=episode == 0)
+            episode_return, _, _, _ = run_episode(env, agent, record=episode == 0)
             print(f"test  episode={episode}  return={episode_return:.1f}")
 
-    import matplotlib.pyplot as plt
+    # Compute primary metrics
+    total_steps = cumulative_steps[-1]
+    train_time = max(time.time() - train_start_time, 1e-9)
+    throughput = total_steps / train_time
+    threshold = float(os.getenv("TARGET_RETURN", "-350"))
+    baseline = -1600.0
+    # Moving average for stability (window=10)
+    def moving_avg(x, w=10):
+        if len(x) == 0:
+            return []
+        w = max(1, min(w, len(x)))
+        c = np.cumsum(np.insert(np.array(x, dtype=float), 0, 0.0))
+        ma = (c[w:] - c[:-w]) / w
+        # pad to original length
+        pad = [ma[0]] * (w - 1)
+        return np.concatenate([pad, ma])
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    axes[0].plot(agent.actor_losses, label="actor loss")
-    axes[0].legend()
-    axes[1].plot(agent.critic_losses, label="critic loss")
-    axes[1].legend()
-    axes[2].plot(agent.alphas, label="alpha")
-    axes[2].plot(agent.alpha_losses, label="alpha loss")
-    axes[2].legend()
+    returns_ma = moving_avg(train_returns, w=10)
+    # Steps-to-threshold based on moving average
+    steps_to_threshold = None
+    for i, r in enumerate(returns_ma):
+        if r >= threshold:
+            steps_to_threshold = cumulative_steps[i+1]
+            break
+    # AUC for returns vs cumulative steps (episode endpoints)
+    x_steps = np.array(cumulative_steps[1:], dtype=float)
+    y_returns = np.array(train_returns, dtype=float)
+    # Normalized AUC in [0, 1] based on baseline and threshold
+    denom = max(1e-9, (threshold - baseline))
+    norm_scores = np.clip((y_returns - baseline) / denom, 0.0, 1.0) if len(y_returns) else np.array([])
+    auc_norm = float(np.trapz(norm_scores, x_steps)) if len(x_steps) > 1 else 0.0
+    auc_norm_frac = auc_norm / x_steps[-1] if len(x_steps) > 0 else 0.0
+
+    # Create a richer progress figure (2x3)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    # 1) Returns
+    ax = axes[0, 0]
+    ax.plot(range(len(train_returns)), train_returns, label="Return per episode", color="#1f77b4")
+    ax.plot(range(len(returns_ma)), returns_ma, label="Return (10-ep MA)", color="#ff7f0e")
+    ax.axhline(threshold, color="red", linestyle="--", label=f"Threshold {threshold}")
+    ax.axhline(baseline, color="gray", linestyle=":", label=f"Baseline {baseline}")
+    ax.set_title("Training Return per Episode")
+    ax.set_xlabel("Episode")
+    ax.set_ylabel("Return")
+    if steps_to_threshold is not None:
+        ax.annotate(f"Steps-to-threshold ≈ {int(steps_to_threshold)}",
+                    xy=(len(train_returns)-1, returns_ma[-1]), xycoords='data',
+                    xytext=(0.5, 0.1), textcoords='axes fraction',
+                    arrowprops=dict(arrowstyle='->', color='gray'),
+                    fontsize=9)
+    ax.legend()
+
+    # 2) Episode length
+    ax = axes[0, 1]
+    ax.plot(range(len(train_lengths)), train_lengths, label="Episode length", color="#2ca02c")
+    ax.set_title("Episode Length")
+    ax.set_xlabel("Episode")
+    ax.set_ylabel("Steps")
+    ax.legend()
+
+    # 3) Critic loss (MA)
+    ax = axes[0, 2]
+    critic_ma = moving_avg(agent.critic_losses, w=50)
+    ax.plot(range(len(critic_ma)), critic_ma, label="Critic loss (MA)", color="#d62728")
+    ax.set_title("Critic TD Error Trend")
+    ax.set_xlabel("Update step")
+    ax.set_ylabel("Loss")
+    ax.legend()
+
+    # 4) Alpha and alpha loss
+    ax = axes[1, 0]
+    ax.plot(range(len(agent.alphas)), agent.alphas, label="Alpha (temperature)", color="#9467bd")
+    ax.set_title("Entropy Temperature α")
+    ax.set_xlabel("Update step")
+    ax.set_ylabel("Alpha")
+    ax2 = ax.twinx()
+    alpha_loss_ma = moving_avg(agent.alpha_losses, w=50)
+    ax2.plot(range(len(alpha_loss_ma)), alpha_loss_ma, label="Alpha loss (MA)", color="#8c564b")
+    ax2.set_ylabel("Alpha loss")
+    ax.legend(loc='upper left')
+    ax2.legend(loc='upper right')
+
+    # 5) Q1–Q2 gap (MA)
+    ax = axes[1, 1]
+    gap_ma = moving_avg(agent.q_gaps, w=50)
+    ax.plot(range(len(gap_ma)), gap_ma, label="|Q1 - Q2| (MA)", color="#e377c2")
+    ax.set_title("Q-function Disagreement")
+    ax.set_xlabel("Update step")
+    ax.set_ylabel("Mean absolute gap")
+    ax.legend()
+
+    # 6) Action stats
+    ax = axes[1, 2]
+    ax.plot(range(len(action_means)), action_means, label="Action mean", color="#17becf")
+    ax.plot(range(len(action_stds)), action_stds, label="Action std", color="#bcbd22")
+    ax.set_title("Action Statistics per Episode")
+    ax.set_xlabel("Episode")
+    ax.set_ylabel("Value")
+    ax.legend()
+
+    # Global figure note and spacing
+    title = (
+        f"Training Diagnostics | total steps={total_steps}, "
+        f"throughput={throughput:.1f} steps/s, norm AUC={auc_norm_frac:.3f} (baseline={baseline}, threshold={threshold})"
+    )
+    fig.suptitle(title, fontsize=12)
+    # Make space so titles/labels don't overlap
+    fig.tight_layout(rect=[0, 0.02, 1, 0.93])
     plt.savefig("progress.pdf", bbox_inches="tight")
 
     plt.matshow(agent.memory.sars.detach().cpu().numpy().T, cmap="viridis", aspect="auto")
     plt.yticks(range(8), ["cos(theta)", "sin(theta)", "theta_dot", "torque action", "reward", "cos(theta')", "sin(theta')", "theta_dot'"])
+    plt.xlabel("Experience index (time)")
     for spine in plt.gca().spines.values():
         spine.set_visible(False)
-    plt.savefig("buffer.png", bbox_inches="tight")
+    plt.savefig("buffer.png", bbox_inches="tight", dpi=300)
     print("Saved progress plots to progress.pdf and ordered experience buffer to buffer.png")
