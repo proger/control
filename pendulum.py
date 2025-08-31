@@ -5,9 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from gymnasium.envs.classic_control import PendulumEnv
-from gymnasium.wrappers.monitoring.video_recorder import VideoRecorder
-from gymnasium.wrappers.rescale_action import RescaleAction
-from gymnasium.wrappers.time_limit import TimeLimit
+from gymnasium.wrappers import RecordVideo, RescaleAction, TimeLimit
 
 
 def reparametrize(mean_logstd, deterministic=True, LOG_STD_MIN=-20, LOG_STD_MAX=2):
@@ -231,9 +229,6 @@ def run_episode(env, agent, record=False):
     state = torch.from_numpy(state).float().to(device)
     episode_return, truncated = 0.0, False
 
-    if record:
-        rec = VideoRecorder(env, "pendulum_episode.mp4")
-
     while not truncated:
         with torch.inference_mode():
             action = agent(state)
@@ -241,16 +236,10 @@ def run_episode(env, agent, record=False):
         next_state = torch.from_numpy(next_state).float().to(device)
         reward = torch.tensor([reward], dtype=torch.float).to(device)
 
-        if record:
-            rec.capture_frame()
-
         agent.learn(state, action, reward, next_state)
 
         episode_return += reward
         state = next_state
-
-    if record:
-        rec.close()
 
     return episode_return.item()
 
@@ -265,17 +254,20 @@ if __name__ == '__main__':
     for episode in range(50):
         agent.train()
         episode_return = run_episode(env, agent)
-        print(f"train episode={episode:02}, return={episode_return:.1f} angle={env.get_wrapper_attr('state')[0]:.2f}")
+        print(f"train episode={episode:02} return={episode_return:.1f} angle={env.get_wrapper_attr('state')[0]:.2f}")
  
     print('Memory buffer has retained', min(agent.memory.entries, agent.memory.max_size), 'out of', agent.memory.entries, 'experiences')
 
     env = make_env(target_angle=target_angle, train=False)
+    # Wrap env to record only the first evaluation episode
+    env = RecordVideo(env, video_folder=".", name_prefix="pendulum_episode",
+                      episode_trigger=lambda e: e == 0)
 
     for episode in range(50):
         with torch.inference_mode():
             agent.eval()
             episode_return = run_episode(env, agent, record=episode == 0)
-            print(f"test  episode={episode}, return={episode_return:.1f}")
+            print(f"test  episode={episode}  return={episode_return:.1f}")
 
     import matplotlib.pyplot as plt
 
