@@ -7,5 +7,5 @@ Inspired by [Learning to Modulate pre-trained Models in RL](https://openreview.n
 To prepare the environment, run:
 
 ```
-pip install gymnasium[other, classic_control] torch
+pip install 'gymnasium[other, classic_control]' torch
 ```
