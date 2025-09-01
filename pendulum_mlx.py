@@ -3,6 +3,7 @@ import os
 import time
 
 import mlx.core as mx
+
 import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
@@ -17,7 +18,7 @@ class NoisyPendulum(PendulumEnv):
         self.eps = eps
         self.target_angle = self.angle_normalize(target_angle)
         self.max_speed = 8
-        self.max_torque = 2.0  # you want more torque for weird angles
+        self.max_torque = 2.0 # you want more torque for weird angles
 
     def _get_obs(self):
         theta, thetadot = self.state
@@ -27,21 +28,25 @@ class NoisyPendulum(PendulumEnv):
         return ((x + np.pi) % (2 * np.pi)) - np.pi
 
     def reward(self, th, thdot, u):
-        cost = np.abs(self.target_angle - self.angle_normalize(th)) ** 2 + 0.1 * thdot ** 2 + 0.001 * (u ** 2)
+        cost = np.abs(self.target_angle - self.angle_normalize(th))**2 + 0.1 * thdot ** 2 + 0.001 * (u ** 2)
         return -cost
 
     def step(self, u):
-        u = u * self.max_torque
-        th, thdot = self.state
+        u = u * self.max_torque # rescale the action from -1..1 to -max_torque..max_torque
+        th, thdot = self.state  # th := theta
+
         g = self.g
         m = self.m
         l = self.l
         dt = self.dt
+
         u = np.clip(u, -self.max_torque, self.max_torque)[0]
-        self.last_u = u
+        self.last_u = u  # for rendering
+
         newthdot = thdot + (3 * g / (2 * l) * np.sin(th) + 3.0 / (m * l ** 2) * u) * dt
         newthdot = np.clip(newthdot, -self.max_speed, self.max_speed)
         newth = th + newthdot * dt
+
         self.state = np.array([newth, newthdot])
         return self._get_obs(), self.reward(th, thdot, u), False, False, {}
 
@@ -52,6 +57,7 @@ class NoisyPendulum(PendulumEnv):
         low = np.asarray([np.pi - eps, -eps])
         self.state = self.np_random.uniform(low=low, high=high)
         self.last_u = None
+
         if self.render_mode == "human":
             self.render()
         return self._get_obs(), {}
@@ -70,34 +76,21 @@ def make_env(target_angle: float = 0, g=10.0, train=True):
     return env
 
 
-def xavier(shape, scale=1.0):
-    fan_in = shape[0]
-    limit = scale * math.sqrt(6.0 / fan_in)
-    return mx.random.uniform(low=-limit, high=limit, shape=shape)
-
-
 def init_mlp(sizes):
     params = {}
     for i in range(len(sizes) - 1):
+        fan_in = sizes[i]
+        fan_out = sizes[i + 1]
+        bound = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 0.0
         params[f"l{i+1}"] = {
-            "w": xavier((sizes[i], sizes[i + 1])),
-            "b": mx.zeros((sizes[i + 1],)),
+            "w": mx.random.uniform(low=-bound, high=bound, shape=(fan_in, fan_out)),
+            "b": mx.random.uniform(low=-bound, high=bound, shape=(fan_out,)),
         }
     return params
 
 
 def linear(p, x):
     return x @ p["w"] + p["b"]
-
-
-def mlp_forward(params, x, activation=True):
-    n = len(params)
-    for i in range(1, n):
-        x = nn.relu(linear(params[f"l{i}"], x))
-    x = linear(params[f"l{n}"], x)
-    if activation:
-        return x
-    return x
 
 
 def reparametrize(mean_logstd, deterministic=True, LOG_STD_MIN=-20.0, LOG_STD_MAX=2.0):
@@ -134,7 +127,7 @@ class ReplayBuffer:
 
     def put(self, s, a, r, s2):
         i = self.entries % self.max_size
-        row = np.concatenate([s, a, [r], s2]).astype(np.float32)
+        row = np.concatenate([s, a, r[np.newaxis], s2])
         self.buf[i] = row
         self.entries += 1
 
@@ -161,22 +154,23 @@ class Agent:
         self.batch_size = 200
 
         self.actor = init_mlp([self.state_dim, 256, 256, self.action_dim * 2])
+        self.opt_actor = optim.Adam(learning_rate=1e-3, bias_correction=True)
+
         self.q1 = init_mlp([self.state_dim + self.action_dim, 256, 256, 1])
+        self.opt_q1 = optim.Adam(learning_rate=1e-3, bias_correction=True)
         self.q2 = init_mlp([self.state_dim + self.action_dim, 256, 256, 1])
-        # Targets (deep clone of pytree of arrays)
+        self.opt_q2 = optim.Adam(learning_rate=1e-3, bias_correction=True)
+
         def tree_clone(tree):
             if isinstance(tree, dict):
                 return {k: tree_clone(v) for k, v in tree.items()}
-            # create a new array with same values
             return tree + mx.zeros_like(tree)
         self.q1_target = tree_clone(self.q1)
         self.q2_target = tree_clone(self.q2)
 
-        self.alpha_log = mx.array(math.log(1.0), dtype=mx.float32)
-        # Separate optimizers to match MLX API expectations
-        self.opt_q = optim.Adam(learning_rate=1e-3)
-        self.opt_actor = optim.Adam(learning_rate=1e-3)
-        self.opt_alpha = optim.Adam(learning_rate=6e-4)
+        self.alpha_log = mx.array(math.log(1))
+        self.opt_alpha = optim.Adam(learning_rate=6e-4, bias_correction=False)
+        self.opt_alpha.init_single(self.alpha_log, self.opt_alpha.state)
 
         self.memory = ReplayBuffer(2000, 10000, state_dim=self.state_dim, action_dim=self.action_dim)
 
@@ -190,129 +184,103 @@ class Agent:
         self.critic_losses = []
         self.q_gaps = []
         self.learning_steps = 0
-        self.training = True
 
-    # Mode toggles for parity
-    def train(self):
-        self.training = True
-
-    def eval(self):
-        self.training = False
-
-    def actor_forward(self, s, params=None):
-        p = self.actor if params is None else params
+    def actor_forward(self, params, s):
+        p = params
         x = s
         x = nn.relu(linear(p["l1"], x))
         x = nn.relu(linear(p["l2"], x))
         x = linear(p["l3"], x)
         return x
 
-    def q_forward(self, q, s, a):
+    def q_forward(self, q, s, a, target=None):
         x = mx.concatenate([s, a], axis=-1)
         x = nn.relu(linear(q["l1"], x))
         x = nn.relu(linear(q["l2"], x))
         x = linear(q["l3"], x)
-        return x
+        if target is not None:
+            return (x - target).square().mean(), x
+        else:
+            return -mx.inf, x
 
-    # Match torch Agent.forward behavior
-    def __call__(self, state):
+    def __call__(self, state, deterministic=True):
         if self.learning_steps == 0:
             return (np.random.rand(1).astype(np.float32) * 2 - 1)
-        x = mx.array(state.reshape(1, -1))
-        mean_logstd = self.actor_forward(x)
-        deterministic = self.training
-        a, _ = reparametrize(mean_logstd, deterministic=deterministic)
-        return np.asarray(a)[0]
 
-    def learn(self, s, a, r, s2):
-        if not isinstance(s, np.ndarray):
-            s = np.asarray(s, dtype=np.float32)
-        if not isinstance(a, np.ndarray):
-            a = np.asarray(a, dtype=np.float32)
-        if not isinstance(s2, np.ndarray):
-            s2 = np.asarray(s2, dtype=np.float32)
-        self.memory.put(s, a, float(r), s2)
+        state = state[None, :]
+        mean_logstd = self.actor_forward(self.actor, state)
+        action, logprob = reparametrize(mean_logstd, deterministic=deterministic)
+        return action[0]
+
+    def learn(self, state, action, reward, next_state):
+        self.memory.put(state, action, reward, next_state)
 
         if not self.memory.has_enough():
             return
 
         self.learning_steps += 1
-        s_b, a_b, r_b, s2_b = self.memory.sample(self.batch_size)
-        self.update_critic(s_b, a_b, r_b, s2_b)
+
+        s_batch, a_batch, r_batch, s2_batch = self.memory.sample(self.batch_size)
+        self.update_critic(s_batch, a_batch, r_batch, s2_batch)
+
         if self.learning_steps % 3 == 0:
             for _ in range(3):
-                self.update_actor(s_b)
+                self.update_actor(s_batch)
+
             self.ema_update(self.q1, self.q1_target, self.ewma_forget)
             self.ema_update(self.q2, self.q2_target, self.ewma_forget)
 
-    def update_critic(self, s_b, a_b, r_b, s2_b):
-        td = self.td_discount
-        alpha_log = self.alpha_log
+    def update_critic(self, states, actions, rewards, next_states):
+        next_actions, log_prob = reparametrize(
+            self.actor_forward(self.actor, next_states),
+            deterministic=False
+        )
 
-        def loss_q(q1, q2):
-            mean_logstd_s2 = self.actor_forward(s2_b)
-            a2, logp2 = reparametrize(mean_logstd_s2, deterministic=False)
-            q1_t = self.q_forward(self.q1_target, s2_b, a2)
-            q2_t = self.q_forward(self.q2_target, s2_b, a2)
-            q_t_min = mx.minimum(q1_t, q2_t)
-            v_next = q_t_min - mx.exp(alpha_log) * logp2
-            y = r_b + td * v_next
-            q1_pred = self.q_forward(q1, s_b, a_b)
-            q2_pred = self.q_forward(q2, s_b, a_b)
-            return mx.mean((q1_pred - y) ** 2 + (q2_pred - y) ** 2)
+        td_target = mx.minimum(
+            self.q_forward(self.q1_target, next_states, next_actions)[1],
+            self.q_forward(self.q2_target, next_states, next_actions)[1]
+        ) - self.alpha_log.exp() * log_prob
 
-        g_q1, g_q2 = mx.grad(loss_q, argnums=(0, 1))(self.q1, self.q2)
-        # For metrics, compute preds before update
-        q1_pred = self.q_forward(self.q1, s_b, a_b)
-        q2_pred = self.q_forward(self.q2, s_b, a_b)
-        loss_val = loss_q(self.q1, self.q2)
-        params = {"q1": self.q1, "q2": self.q2}
-        grads = {"q1": g_q1, "q2": g_q2}
-        updated = self.opt_q.apply_gradients(grads, params)
-        self.q1, self.q2 = updated["q1"], updated["q2"]
-        mx.eval(loss_val, q1_pred, q2_pred)
-        self.critic_losses.append(float(loss_val))
-        self.q_gaps.append(float(mx.mean(mx.abs(q1_pred - q2_pred))))
+        target_q_value = rewards + self.td_discount * td_target
 
-    def update_actor(self, s_b):
-        # actor loss
-        def a_loss(actor_params):
-            mean_logstd = self.actor_forward(s_b, params=actor_params)
-            a_s, logp = reparametrize(mean_logstd, deterministic=False)
-            q1_s = mx.stop_gradient(self.q_forward(self.q1, s_b, a_s))
-            q2_s = mx.stop_gradient(self.q_forward(self.q2, s_b, a_s))
-            qmin = mx.minimum(q1_s, q2_s)
-            return mx.mean(mx.stop_gradient(mx.exp(self.alpha_log)) * logp - qmin)
+        q = mx.value_and_grad(self.q_forward)
+        (q1_loss, q1_pred), q1_grads = q(self.q1, states, actions, target=target_q_value)
+        (q2_loss, q2_pred), q2_grads = q(self.q2, states, actions, target=target_q_value)
+        self.q1 = self.opt_q1.apply_gradients(q1_grads, self.q1)
+        self.q2 = self.opt_q2.apply_gradients(q2_grads, self.q2)
 
-        g_actor = mx.grad(a_loss)(self.actor)
-        params = {"actor": self.actor}
-        grads = {"actor": g_actor}
-        updated = self.opt_actor.apply_gradients(grads, params)
-        self.actor = updated["actor"]
+        self.critic_losses.append((q1_loss + q2_loss).item())
+        self.q_gaps.append((q1_pred - q2_pred).abs().mean().item())
 
-        # alpha loss
-        def al_loss(alpha_log_param):
-            mean_logstd = self.actor_forward(s_b)
-            _, logp = reparametrize(mean_logstd, deterministic=False)
-            target_entropy = -1.0
-            alpha = mx.exp(alpha_log_param)
-            return -mx.mean(alpha * mx.stop_gradient(logp + target_entropy))
+    def actor_loss(self, actor_params, states):
+        actions, logprob = reparametrize(
+            self.actor_forward(actor_params, states),
+            deterministic=False
+        )
 
-        g_alpha = mx.grad(al_loss)(self.alpha_log)
-        params = {"alpha_log": self.alpha_log}
-        grads = {"alpha_log": g_alpha}
-        updated = self.opt_alpha.apply_gradients(grads, params)
-        self.alpha_log = updated["alpha_log"]
-        # clamp
-        self.alpha_log = mx.clip(self.alpha_log, mx.array(math.log(0.01)), mx.array(math.log(1.0)))
+        actor_loss = (- mx.minimum(
+            self.q_forward(self.q1_target, states, actions)[1],
+            self.q_forward(self.q2_target, states, actions)[1]
+        ) + self.alpha_log.exp() * logprob).mean()
+        return actor_loss, logprob
 
-        # metrics
-        a_loss_val = a_loss(self.actor)
-        al_loss_val = al_loss(self.alpha_log)
-        mx.eval(a_loss_val, al_loss_val)
-        self.actor_losses.append(float(a_loss_val))
-        self.alpha_losses.append(float(al_loss_val))
-        self.alphas.append(float(mx.exp(self.alpha_log)))
+    def alpha_loss(self, alpha_log, logprob):
+        return -(- alpha_log.exp() * (logprob + 1)).mean()
+
+    def update_actor(self, states):
+        loss = mx.value_and_grad(self.actor_loss)
+        (l, logprob), actor_grads = loss(self.actor, states)
+        self.actor_losses.append(l.item())
+        self.actor = self.opt_actor.apply_gradients(actor_grads, self.actor)
+
+        alpha_loss = mx.value_and_grad(self.alpha_loss)
+        al, alpha_grads = alpha_loss(self.alpha_log, logprob)
+        self.alpha_losses.append(al.item())
+
+        self.alpha_log = self.opt_alpha.apply_single(alpha_grads, self.alpha_log, self.opt_alpha.state)
+        self.alpha_log = mx.clip(self.alpha_log, math.log(0.01), math.log(1))
+
+        self.alphas.append(self.alpha_log.exp())
 
     @staticmethod
     def ema_update(src, tgt, tau):
@@ -323,34 +291,37 @@ class Agent:
                 tgt[k] = tgt[k] * (1.0 - tau) + src[k] * tau
 
 
-def run_episode(env, agent: Agent, record=False):
+def run_episode(env, agent: Agent, learning: bool = True):
     state, _ = env.reset()
     episode_return = 0.0
     truncated = False
     steps = 0
     actions = []
+
     while not truncated:
-        action = agent(np.asarray(state, dtype=np.float32))
-        a = float(action.item()) if hasattr(action, "item") else float(np.asarray(action)[0])
-        next_state, reward, _, truncated, _ = env.step(a)
-        agent.learn(np.asarray(state, dtype=np.float32), np.array([a], dtype=np.float32), float(reward), np.asarray(next_state, dtype=np.float32))
+        state = mx.array(state)
+        action = agent(state, deterministic=learning)
+        next_state, reward, _, truncated, _ = env.step(action.item())
+
+        if learning:
+            agent.learn(state, action, mx.array(reward), mx.array(next_state))
+
         episode_return += reward
         state = next_state
         steps += 1
-        actions.append(a)
+        actions.append(action.item())
+
     action_mean = float(np.mean(actions)) if actions else 0.0
     action_std = float(np.std(actions)) if actions else 0.0
-    return float(episode_return), steps, action_mean, action_std
+    return episode_return.item(), steps, action_mean, action_std
 
 
-def main():
-    # Mirror pendulum.py flow
+if __name__ == "__main__":
     np.random.seed(0)
     mx.random.seed(0)
 
     target_angle = 0
     agent = Agent()
-    agent.train()
     env = make_env(target_angle=target_angle, train=True)
 
     # Tracking
@@ -372,10 +343,7 @@ def main():
         action_stds.append(a_std)
         cumulative_steps.append(cumulative_steps[-1] + ep_steps)
         per_episode_throughput.append(ep_steps / dt)
-        try:
-            angle = env.get_wrapper_attr('state')[0]
-        except Exception:
-            angle = float('nan')
+        angle = env.get_wrapper_attr('state')[0]
         print(f"train episode={episode:02} return={episode_return:.1f} length={ep_steps} angle={angle:.2f}")
 
     print('Memory buffer has retained', min(agent.memory.entries, agent.memory.max_size), 'out of', agent.memory.entries, 'experiences')
@@ -385,15 +353,14 @@ def main():
     env_eval = RecordVideo(env_eval, video_folder='.', name_prefix='pendulum_episode', episode_trigger=lambda e: e == 0)
 
     for episode in range(50):
-        agent.eval()
-        episode_return, _, _, _ = run_episode(env_eval, agent, record=episode == 0)
+        episode_return, _, _, _ = run_episode(env_eval, agent, learning=False)
         print(f"test  episode={episode}  return={episode_return:.1f}")
 
     # Metrics and plots
     total_steps = cumulative_steps[-1]
     train_time = max(time.time() - train_start_time, 1e-9)
     throughput = total_steps / train_time
-    threshold = float(os.getenv("TARGET_RETURN", "-350"))
+    threshold = -350.0
     baseline = -1600.0
 
     def moving_avg(x, w=10):
@@ -489,7 +456,7 @@ def main():
     )
     fig.suptitle(title, fontsize=12)
     fig.tight_layout(rect=[0, 0.02, 1, 0.93])
-    plt.savefig("progress.pdf", bbox_inches="tight")
+    plt.savefig("progress_mlx.pdf", bbox_inches="tight")
 
     plt.matshow(agent.memory.buf.T, cmap="viridis", aspect="auto")
     plt.yticks(range(8), ["cos(theta)", "sin(theta)", "theta_dot", "torque action", "reward", "cos(theta')", "sin(theta')", "theta_dot'"])
@@ -498,7 +465,3 @@ def main():
         spine.set_visible(False)
     plt.savefig("buffer.png", bbox_inches="tight", dpi=300)
     print("Saved progress plots to progress.pdf and ordered experience buffer to buffer.png")
-
-
-if __name__ == "__main__":
-    main()
