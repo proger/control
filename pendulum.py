@@ -177,6 +177,7 @@ class Agent(nn.Module):
         for param_target, param_input in zip(target_net.parameters(), input_net.parameters()):
             param_target.data.copy_(param_target.data * (1.0 - ewma_forget) + param_input.data * ewma_forget)
 
+
 class NoisyPendulum(PendulumEnv):
     def __init__(self, target_angle: float = 0, g: float = 10.0, eps: float = 0.0, *args, **kwargs):
         super().__init__(g=g, *args, **kwargs)
@@ -291,7 +292,7 @@ if __name__ == '__main__':
         cumulative_steps.append(cumulative_steps[-1] + ep_steps)
         per_episode_throughput.append(ep_steps / dt)
         print(f"train episode={episode:02} return={episode_return:.1f} length={ep_steps} angle={env.get_wrapper_attr('state')[0]:.2f}")
- 
+
     print('Memory buffer has retained', min(agent.memory.entries, agent.memory.max_size), 'out of', agent.memory.entries, 'experiences')
 
     env = make_env(target_angle=target_angle, train=False)
@@ -309,7 +310,7 @@ if __name__ == '__main__':
     total_steps = cumulative_steps[-1]
     train_time = max(time.time() - train_start_time, 1e-9)
     throughput = total_steps / train_time
-    threshold = float(os.getenv("TARGET_RETURN", "-350"))
+    threshold = -350.0
     baseline = -1600.0
     # Moving average for stability (window=10)
     def moving_avg(x, w=10):
