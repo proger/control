@@ -1,6 +1,7 @@
 import math
 import os
 import time
+import shutil
 from collections import deque
 
 import mlx.core as mx
@@ -8,7 +9,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
-import matplotlib.pyplot as plt
 from gymnasium.envs.classic_control import PendulumEnv
 from gymnasium.wrappers import RescaleAction, TimeLimit, RecordVideo
 from mlx.utils import tree_map
@@ -206,6 +206,65 @@ class ReplayBuffer:
         )
 
 
+def _flatten_tree(tree, prefix="", out=None):
+    if out is None:
+        out = {}
+    if isinstance(tree, dict):
+        for k, v in tree.items():
+            _flatten_tree(v, f"{prefix}{k}/" if prefix else f"{k}/", out)
+    else:
+        out[prefix[:-1]] = np.array(tree)
+    return out
+
+
+def save_checkpoint_npz(path: str, agent) -> None:
+    packs = {
+        "actor": agent.actor,
+        "q1": agent.q1,
+        "q2": agent.q2,
+        "q1_target": agent.q1_target,
+        "q2_target": agent.q2_target,
+        "alpha_log": agent.alpha_log,
+    }
+    flat = {}
+    for name, obj in packs.items():
+        if isinstance(obj, dict):
+            x = _flatten_tree(obj)
+            flat.update({f"{name}/{k}": v for k, v in x.items()})
+        else:
+            flat[name] = np.array(obj)
+    np.savez(path, **flat)
+
+
+def _assign_from_flat(flat, base, tree):
+    for k, v in tree.items():
+        key = f"{base}/{k}"
+        if isinstance(v, dict):
+            _assign_from_flat(flat, key, v)
+        else:
+            if key in flat:
+                tree[k] = mx.array(flat[key])
+    return tree
+
+
+def load_checkpoint_npz(path: str, agent) -> None:
+    data = np.load(path, allow_pickle=False)
+    flat = {k: data[k] for k in data.files}
+    if 'actor/l1/w' in flat:
+        _assign_from_flat(flat, 'actor', agent.actor)
+    if 'q1/l1/w' in flat:
+        _assign_from_flat(flat, 'q1', agent.q1)
+    if 'q2/l1/w' in flat:
+        _assign_from_flat(flat, 'q2', agent.q2)
+    if 'q1_target/l1/w' in flat:
+        _assign_from_flat(flat, 'q1_target', agent.q1_target)
+    if 'q2_target/l1/w' in flat:
+        _assign_from_flat(flat, 'q2_target', agent.q2_target)
+    if 'alpha_log' in flat:
+        agent.alpha_log = mx.array(flat['alpha_log'])
+    mx.eval(agent.actor, agent.q1, agent.q2, agent.q1_target, agent.q2_target, agent.alpha_log)
+
+
 class Agent:
     def __init__(self, video=False):
         self.obs_dim = 16 * 16 * 8 if video else 3
@@ -383,155 +442,120 @@ def run_episode(env, agent: Agent, learning: bool = True):
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--load', type=str, default=None)
+    parser.add_argument('--test', type=int, default=10)
+    parser.add_argument('--target_angle', type=float, default=0.0)
+    parser.add_argument('--train', type=int, default=0)
+    args = parser.parse_args()
+
     np.random.seed(0)
     mx.random.seed(0)
 
     video = True
-    target_angle = 0
-    env = make_env(target_angle=target_angle, train=True, video=video)
     agent = Agent(video=video)
+    if args.load:
+        load_checkpoint_npz(args.load, agent)
 
-    # Tracking
-    train_returns = []
-    train_lengths = []
-    action_means = []
-    action_stds = []
-    cumulative_steps = [0]
-    per_episode_throughput = []
-    train_start_time = time.time()
+    ts = time.strftime('%Y%m%d-%H%M%S')
+    out = os.path.join('exp', ts)
+    os.makedirs(out, exist_ok=True)
 
-    for episode in range(2000):
-        t0 = time.time()
-        episode_return, ep_steps, a_mean, a_std = run_episode(env, agent)
-        dt = max(time.time() - t0, 1e-9)
-        train_returns.append(episode_return)
-        train_lengths.append(ep_steps)
-        action_means.append(a_mean)
-        action_stds.append(a_std)
-        cumulative_steps.append(cumulative_steps[-1] + ep_steps)
-        per_episode_throughput.append(ep_steps / dt)
-        angle = env.get_wrapper_attr('state')[0]
-        print(f"train episode={episode:02} return={episode_return:.1f} length={ep_steps} angle={angle:.2f}")
+    if args.train:
+        try:
+            shutil.copyfile(__file__, os.path.join(out, 'pendulum_mlx.py'))
+            if os.path.exists('plotting_mlx.py'):
+                shutil.copyfile('plotting_mlx.py', os.path.join(out, 'plotting_mlx.py'))
+        except Exception:
+            pass
 
-    print('Memory buffer has retained', min(agent.memory.entries, agent.memory.max_size), 'out of', agent.memory.entries, 'experiences')
+        log_file = open(os.path.join(out, 'log.txt'), 'a', buffering=1)
 
-    env_eval = make_env(target_angle=target_angle, train=False, video=video)
-    env_eval = RecordVideo(env_eval, video_folder='.', name_prefix='pendulum_episode', episode_trigger=lambda e: e == 0)
+        def log(msg: str) -> None:
+            print(msg)
+            print(msg, file=log_file, flush=True)
 
-    for episode in range(2):
-        episode_return, _, _, _ = run_episode(env_eval, agent, learning=False)
-        print(f"test  episode={episode}  return={episode_return:.1f}")
+        train_log_path = os.path.join(out, 'train_log.txt')
+        train_log_file = open(train_log_path, 'a', buffering=1)
+        if train_log_file.tell() == 0:
+            train_log_file.write('# episode\treturn\tlength\taction_mean\taction_std\tsteps_total\tthroughput_steps_per_s\n')
 
-    # Metrics and plots
-    total_steps = cumulative_steps[-1]
-    train_time = max(time.time() - train_start_time, 1e-9)
-    throughput = total_steps / train_time
-    threshold = -350.0
-    baseline = -1600.0
+        import plotting_mlx as pm
 
-    def moving_avg(x, w=10):
-        if len(x) == 0:
-            return []
-        w = max(1, min(w, len(x)))
-        c = np.cumsum(np.insert(np.array(x, dtype=float), 0, 0.0))
-        ma = (c[w:] - c[:-w]) / w
-        pad = [ma[0]] * (w - 1)
-        return np.concatenate([pad, ma])
+        env = make_env(target_angle=args.target_angle, train=True, video=video)
 
-    returns_ma = moving_avg(train_returns, w=10)
-    steps_to_threshold = None
-    for i, r in enumerate(returns_ma):
-        if r >= threshold:
-            steps_to_threshold = cumulative_steps[i + 1]
-            break
+        train_returns: list[float] = []
+        train_lengths: list[int] = []
+        action_means: list[float] = []
+        action_stds: list[float] = []
+        cumulative_steps: list[int] = [0]
+        episode_throughputs: list[float] = []
+        train_start_time = time.time()
 
-    x_steps = np.array(cumulative_steps[1:], dtype=float)
-    y_returns = np.array(train_returns, dtype=float)
-    denom = max(1e-9, (threshold - baseline))
-    norm_scores = np.clip((y_returns - baseline) / denom, 0.0, 1.0) if len(y_returns) else np.array([])
-    auc_norm = float(np.trapz(norm_scores, x_steps)) if len(x_steps) > 1 else 0.0
-    auc_norm_frac = auc_norm / x_steps[-1] if len(x_steps) > 0 else 0.0
+        for episode in range(args.train):
+            ep_start = time.time()
+            episode_return, ep_steps, a_mean, a_std = run_episode(env, agent)
+            elapsed = max(time.time() - ep_start, 1e-9)
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    ax = axes[0, 0]
-    ax.plot(range(len(train_returns)), train_returns, label="Return per episode", color="#1f77b4")
-    ax.plot(range(len(returns_ma)), returns_ma, label="Return (10-ep MA)", color="#ff7f0e")
-    ax.axhline(threshold, color="red", linestyle="--", label=f"Threshold {threshold}")
-    ax.axhline(baseline, color="gray", linestyle=":", label=f"Baseline {baseline}")
-    ax.set_title("Training Return per Episode")
-    ax.set_xlabel("Episode")
-    ax.set_ylabel("Return")
-    if steps_to_threshold is not None:
-        ax.annotate(
-            f"Steps-to-threshold ≈ {int(steps_to_threshold)}",
-            xy=(len(train_returns) - 1, returns_ma[-1]),
-            xycoords='data',
-            xytext=(0.5, 0.1),
-            textcoords='axes fraction',
-            arrowprops=dict(arrowstyle='->', color='gray'),
-            fontsize=9,
+            train_returns.append(episode_return)
+            train_lengths.append(ep_steps)
+            action_means.append(a_mean)
+            action_stds.append(a_std)
+            cumulative_steps.append(cumulative_steps[-1] + ep_steps)
+            episode_throughputs.append(ep_steps / elapsed)
+
+            angle = env.get_wrapper_attr('state')[0]
+            log(
+                f"train ep={episode:04d} ret={episode_return:.1f} len={ep_steps} "
+                f"angle={angle:.2f} steps/s={episode_throughputs[-1]:.1f}"
+            )
+            train_log_file.write(
+                f"{episode}\t{episode_return:.6f}\t{ep_steps}\t{a_mean:.6f}\t{a_std:.6f}\t{cumulative_steps[-1]}\t{episode_throughputs[-1]:.6f}\n"
+            )
+            train_log_file.flush()
+
+            if episode % 100 == 0 and episode > 0:
+                pm.save_progress(
+                    out,
+                    agent,
+                    train_returns,
+                    train_lengths,
+                    action_means,
+                    action_stds,
+                    cumulative_steps,
+                    train_start_time,
+                )
+
+        kept = min(agent.memory.entries, agent.memory.max_size)
+        log(f"buffer kept {kept} / {agent.memory.entries}")
+
+        pm.save_progress(
+            out,
+            agent,
+            train_returns,
+            train_lengths,
+            action_means,
+            action_stds,
+            cumulative_steps,
+            train_start_time,
+            final=True,
         )
-    ax.legend()
+        ckpt = os.path.join(out, 'checkpoint_final.npz')
+        save_checkpoint_npz(ckpt, agent)
+        log(f"saved plots + buffer + checkpoint -> {ckpt}")
 
-    ax = axes[0, 1]
-    ax.plot(range(len(train_lengths)), train_lengths, label="Episode length", color="#2ca02c")
-    ax.set_title("Episode Length")
-    ax.set_xlabel("Episode")
-    ax.set_ylabel("Steps")
-    ax.legend()
+        log_file.close()
+        train_log_file.close()
 
-    ax = axes[0, 2]
-    critic_ma = moving_avg(agent.critic_losses, w=50)
-    ax.plot(range(len(critic_ma)), critic_ma, label="Critic loss (MA)", color="#d62728")
-    ax.set_title("Critic TD Error Trend")
-    ax.set_xlabel("Update step")
-    ax.set_ylabel("Loss")
-    ax.legend()
-
-    ax = axes[1, 0]
-    ax.plot(range(len(agent.alphas)), agent.alphas, label="Alpha (temperature)", color="#9467bd")
-    ax.set_title("Entropy Temperature α")
-    ax.set_xlabel("Update step")
-    ax.set_ylabel("Alpha")
-    ax2 = ax.twinx()
-    alpha_loss_ma = moving_avg(agent.alpha_losses, w=50)
-    ax2.plot(range(len(alpha_loss_ma)), alpha_loss_ma, label="Alpha loss (MA)", color="#8c564b")
-    ax2.set_ylabel("Alpha loss")
-    ax.legend(loc='upper left')
-    ax2.legend(loc='upper right')
-
-    ax = axes[1, 1]
-    gap_ma = moving_avg(agent.q_gaps, w=50)
-    ax.plot(range(len(gap_ma)), gap_ma, label="|Q1 - Q2| (MA)", color="#e377c2")
-    ax.set_title("Q-function Disagreement")
-    ax.set_xlabel("Update step")
-    ax.set_ylabel("Mean absolute gap")
-    ax.legend()
-
-    ax = axes[1, 2]
-    ax.plot(range(len(action_means)), action_means, label="Action mean", color="#17becf")
-    ax.plot(range(len(action_stds)), action_stds, label="Action std", color="#bcbd22")
-    ax.set_title("Action Statistics per Episode")
-    ax.set_xlabel("Episode")
-    ax.set_ylabel("Value")
-    ax.legend()
-
-    title = (
-        f"Training Diagnostics | total steps={total_steps}, "
-        f"throughput={throughput:.1f} steps/s, norm AUC={auc_norm_frac:.3f} (baseline={baseline}, threshold={threshold})"
-    )
-    fig.suptitle(title, fontsize=12)
-    fig.tight_layout(rect=[0, 0.02, 1, 0.93])
-    plt.savefig("progress_mlx.pdf", bbox_inches="tight")
-
-    plt.matshow(agent.memory.buf.T, cmap="viridis", aspect="auto")
-    if not video:
-        plt.yticks(range(8), ["cos(theta)", "sin(theta)", "theta_dot", "torque action", "reward", "cos(theta')", "sin(theta')", "theta_dot'"])
-    else:
-        plt.yticks([])
-        plt.ylabel(f"Features (2×{agent.state_dim} + action + reward)")
-    plt.xlabel("Experience index (time)")
-    for spine in plt.gca().spines.values():
-        spine.set_visible(False)
-    plt.savefig("buffer.png", bbox_inches="tight", dpi=300)
-    print("Saved progress plots to progress.pdf and ordered experience buffer to buffer.png")
+    if args.test:
+        env_eval = make_env(target_angle=args.target_angle, train=False, video=video)
+        env_eval = RecordVideo(
+            env_eval,
+            video_folder=out,
+            name_prefix='pendulum_episode',
+            episode_trigger=lambda e: e == 5,
+        )
+        for episode in range(args.test):
+            eval_return, _, _, _ = run_episode(env_eval, agent, learning=False)
+            print(f"test  ep={episode} ret={eval_return:.1f}")
