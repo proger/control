@@ -1,6 +1,7 @@
 import math
 import os
 import time
+from collections import deque
 
 import mlx.core as mx
 
@@ -10,26 +11,84 @@ import numpy as np
 import matplotlib.pyplot as plt
 from gymnasium.envs.classic_control import PendulumEnv
 from gymnasium.wrappers import RescaleAction, TimeLimit, RecordVideo
+from mlx.utils import tree_map
+
+
+def _frame_to_obs(frame: np.ndarray, size: int = 16) -> np.ndarray:
+    """Convert an RGB frame (H, W, 3) to a small grayscale vector.
+
+    - Converts to grayscale
+    - Downsamples to (size, size) using nearest-neighbor
+    - Normalizes to [0, 1]
+    - Flattens to shape (size*size,)
+    """
+    if frame is None or frame.ndim != 3 or frame.shape[-1] != 3:
+        raise ValueError("Expected RGB frame with shape (H, W, 3)")
+
+    # Grayscale luminance
+    r, g, b = frame[..., 0].astype(np.float32), frame[..., 1].astype(np.float32), frame[..., 2].astype(np.float32)
+    gray = 0.299 * r + 0.587 * g + 0.114 * b
+
+    h, w = gray.shape
+    # Compute strides for simple nearest-neighbor downsampling
+    sh = max(1, h // size)
+    sw = max(1, w // size)
+    ds = gray[::sh, ::sw]
+    # If result is larger than target, crop; if smaller, pad (unlikely)
+    ds = ds[:size, :size]
+    if ds.shape != (size, size):
+        # Pad with edge values to reach target size
+        pad_h = size - ds.shape[0]
+        pad_w = size - ds.shape[1]
+        ds = np.pad(ds, ((0, pad_h), (0, pad_w)), mode='edge')
+
+    # Normalize to [0, 1]
+    ds = ds - ds.min() if ds.size else ds
+    rng = (ds.max() - ds.min()) if ds.size else 1.0
+    if rng > 1e-6:
+        ds = ds / rng
+    ds = ds.astype(np.float32).reshape(-1)
+    # Invert (background is 0)
+    ds = 1 - ds
+    # Binarize
+    #ds = np.where(ds > 0, 1, 0)
+    return ds
 
 
 class NoisyPendulum(PendulumEnv):
-    def __init__(self, target_angle: float = 0, g: float = 10.0, eps: float = 0.0, *args, **kwargs):
+    def __init__(self, target_angle: float = 0, g: float = 10.0, eps: float = 0.0, video: bool = False, *args, **kwargs):
         super().__init__(g=g, *args, **kwargs)
         self.eps = eps
         self.target_angle = self.angle_normalize(target_angle)
         self.max_speed = 8
         self.max_torque = 2.0 # you want more torque for weird angles
+        self.video = video
+        if video:
+            self.obs = deque([np.zeros(16*16)]*8, maxlen=8)  # at least two frames for velocity estimation spaced far enough
 
     def _get_obs(self):
-        theta, thetadot = self.state
-        return np.array([np.cos(theta), np.sin(theta), thetadot], dtype=np.float32)
+        if self.video:
+            frame = PendulumEnv.render(self)
+            self.obs.append(_frame_to_obs(frame))
+            obs = mx.array(np.concatenate(self.obs))
+            return obs
+        else:
+            theta, thetadot = self.state
+            return mx.array([theta - 2*thetadot * self.dt, theta, theta - thetadot * self.dt])
+
+    def render(self):
+        if self.video:
+            frame = np.repeat(np.array(self._get_obs()).reshape(8 * 16, 16)[:, :, None], 3, axis=-1) * 255
+            return frame
+        else:
+            return np.array(self._get_obs())[None, :, None]
 
     def angle_normalize(self, x):
         return ((x + np.pi) % (2 * np.pi)) - np.pi
 
     def reward(self, th, thdot, u):
         cost = np.abs(self.target_angle - self.angle_normalize(th))**2 + 0.1 * thdot ** 2 + 0.001 * (u ** 2)
-        return -cost
+        return mx.array(-cost)[None]
 
     def step(self, u):
         u = u * self.max_torque # rescale the action from -1..1 to -max_torque..max_torque
@@ -41,13 +100,13 @@ class NoisyPendulum(PendulumEnv):
         dt = self.dt
 
         u = np.clip(u, -self.max_torque, self.max_torque)[0]
-        self.last_u = u  # for rendering
+        self.last_u = None if self.video else u  # rendering a direction arrow
 
         newthdot = thdot + (3 * g / (2 * l) * np.sin(th) + 3.0 / (m * l ** 2) * u) * dt
         newthdot = np.clip(newthdot, -self.max_speed, self.max_speed)
         newth = th + newthdot * dt
 
-        self.state = np.array([newth, newthdot])
+        self.state = mx.array(np.array([newth, newthdot]))
         return self._get_obs(), self.reward(th, thdot, u), False, False, {}
 
     def reset(self, *, seed=0, **kwargs):
@@ -63,11 +122,11 @@ class NoisyPendulum(PendulumEnv):
         return self._get_obs(), {}
 
 
-def make_env(target_angle: float = 0, g=10.0, train=True):
+def make_env(target_angle: float = 0, g=10.0, train=True, video=False):
     eps = 0.1 if train else 0.0
     env = TimeLimit(
         RescaleAction(
-            NoisyPendulum(target_angle=target_angle, render_mode="rgb_array", g=g, eps=eps),
+            NoisyPendulum(target_angle=target_angle, render_mode="rgb_array", g=g, eps=eps, video=video),
             min_action=-1,
             max_action=1,
         ),
@@ -76,7 +135,7 @@ def make_env(target_angle: float = 0, g=10.0, train=True):
     return env
 
 
-def init_mlp(sizes):
+def make_mlp(sizes):
     params = {}
     for i in range(len(sizes) - 1):
         fan_in = sizes[i]
@@ -113,7 +172,7 @@ def reparametrize(mean_logstd, deterministic=True, LOG_STD_MIN=-20.0, LOG_STD_MA
 
 
 class ReplayBuffer:
-    def __init__(self, min_size, max_size, state_dim=3, action_dim=1):
+    def __init__(self, min_size, max_size, state_dim, action_dim):
         self.min_size = min_size
         self.max_size = max_size
         self.state_dim = state_dim
@@ -127,7 +186,7 @@ class ReplayBuffer:
 
     def put(self, s, a, r, s2):
         i = self.entries % self.max_size
-        row = np.concatenate([s, a, r[np.newaxis], s2])
+        row = np.concatenate([s, a, r, s2])
         self.buf[i] = row
         self.entries += 1
 
@@ -148,17 +207,22 @@ class ReplayBuffer:
 
 
 class Agent:
-    def __init__(self):
-        self.state_dim = 3
+    def __init__(self, video=False):
+        self.obs_dim = 16 * 16 * 8 if video else 3
+        self.state_dim = self.obs_dim  # encode me maybe
+        self.hidden_dim = 512
         self.action_dim = 1
         self.batch_size = 200
 
-        self.actor = init_mlp([self.state_dim, 256, 256, self.action_dim * 2])
+        # self.state_encoder = make_mlp([self.state_dim, self.hidden_dim])
+        # self.opt_state_encoder = optim.Adam(learning_rate=1e-3, bias_correction=True)
+
+        self.actor = make_mlp([self.state_dim, self.hidden_dim, self.hidden_dim, self.action_dim * 2])
         self.opt_actor = optim.Adam(learning_rate=1e-3, bias_correction=True)
 
-        self.q1 = init_mlp([self.state_dim + self.action_dim, 256, 256, 1])
+        self.q1 = make_mlp([self.state_dim + self.action_dim, self.hidden_dim, self.hidden_dim, 1])
         self.opt_q1 = optim.Adam(learning_rate=1e-3, bias_correction=True)
-        self.q2 = init_mlp([self.state_dim + self.action_dim, 256, 256, 1])
+        self.q2 = make_mlp([self.state_dim + self.action_dim, self.hidden_dim, self.hidden_dim, 1])
         self.opt_q2 = optim.Adam(learning_rate=1e-3, bias_correction=True)
 
         def tree_clone(tree):
@@ -247,7 +311,9 @@ class Agent:
         (q1_loss, q1_pred), q1_grads = q(self.q1, states, actions, target=target_q_value)
         (q2_loss, q2_pred), q2_grads = q(self.q2, states, actions, target=target_q_value)
         self.q1 = self.opt_q1.apply_gradients(q1_grads, self.q1)
+        mx.eval(self.q1)
         self.q2 = self.opt_q2.apply_gradients(q2_grads, self.q2)
+        mx.eval(self.q2)
 
         self.critic_losses.append((q1_loss + q2_loss).item())
         self.q_gaps.append((q1_pred - q2_pred).abs().mean().item())
@@ -272,6 +338,7 @@ class Agent:
         (l, logprob), actor_grads = loss(self.actor, states)
         self.actor_losses.append(l.item())
         self.actor = self.opt_actor.apply_gradients(actor_grads, self.actor)
+        mx.eval(self.actor)
 
         alpha_loss = mx.value_and_grad(self.alpha_loss)
         al, alpha_grads = alpha_loss(self.alpha_log, logprob)
@@ -280,7 +347,7 @@ class Agent:
         self.alpha_log = self.opt_alpha.apply_single(alpha_grads, self.alpha_log, self.opt_alpha.state)
         self.alpha_log = mx.clip(self.alpha_log, math.log(0.01), math.log(1))
 
-        self.alphas.append(self.alpha_log.exp())
+        self.alphas.append(self.alpha_log.exp().item())
 
     @staticmethod
     def ema_update(src, tgt, tau):
@@ -299,12 +366,11 @@ def run_episode(env, agent: Agent, learning: bool = True):
     actions = []
 
     while not truncated:
-        state = mx.array(state)
         action = agent(state, deterministic=learning)
         next_state, reward, _, truncated, _ = env.step(action.item())
 
         if learning:
-            agent.learn(state, action, mx.array(reward), mx.array(next_state))
+            agent.learn(state, action, reward, next_state)
 
         episode_return += reward
         state = next_state
@@ -320,9 +386,10 @@ if __name__ == "__main__":
     np.random.seed(0)
     mx.random.seed(0)
 
+    video = True
     target_angle = 0
-    agent = Agent()
-    env = make_env(target_angle=target_angle, train=True)
+    env = make_env(target_angle=target_angle, train=True, video=video)
+    agent = Agent(video=video)
 
     # Tracking
     train_returns = []
@@ -333,7 +400,7 @@ if __name__ == "__main__":
     per_episode_throughput = []
     train_start_time = time.time()
 
-    for episode in range(50):
+    for episode in range(2000):
         t0 = time.time()
         episode_return, ep_steps, a_mean, a_std = run_episode(env, agent)
         dt = max(time.time() - t0, 1e-9)
@@ -348,11 +415,10 @@ if __name__ == "__main__":
 
     print('Memory buffer has retained', min(agent.memory.entries, agent.memory.max_size), 'out of', agent.memory.entries, 'experiences')
 
-    # Evaluation with video
-    env_eval = make_env(target_angle=target_angle, train=False)
+    env_eval = make_env(target_angle=target_angle, train=False, video=video)
     env_eval = RecordVideo(env_eval, video_folder='.', name_prefix='pendulum_episode', episode_trigger=lambda e: e == 0)
 
-    for episode in range(50):
+    for episode in range(2):
         episode_return, _, _, _ = run_episode(env_eval, agent, learning=False)
         print(f"test  episode={episode}  return={episode_return:.1f}")
 
@@ -459,7 +525,11 @@ if __name__ == "__main__":
     plt.savefig("progress_mlx.pdf", bbox_inches="tight")
 
     plt.matshow(agent.memory.buf.T, cmap="viridis", aspect="auto")
-    plt.yticks(range(8), ["cos(theta)", "sin(theta)", "theta_dot", "torque action", "reward", "cos(theta')", "sin(theta')", "theta_dot'"])
+    if not video:
+        plt.yticks(range(8), ["cos(theta)", "sin(theta)", "theta_dot", "torque action", "reward", "cos(theta')", "sin(theta')", "theta_dot'"])
+    else:
+        plt.yticks([])
+        plt.ylabel(f"Features (2×{agent.state_dim} + action + reward)")
     plt.xlabel("Experience index (time)")
     for spine in plt.gca().spines.values():
         spine.set_visible(False)
